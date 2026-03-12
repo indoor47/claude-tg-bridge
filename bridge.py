@@ -36,7 +36,7 @@ from telegram.ext import (
 
 # ── Configuration ────────────────────────────────────────────────────
 
-VERSION = "15.3.1"
+VERSION = "16.0.0"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USERS = {
     int(x)
@@ -238,7 +238,7 @@ init_db()
 @dataclass
 class UserState:
     process: asyncio.subprocess.Process | None = None
-    queue: list[str] = field(default_factory=list)
+    inject_queue: list[str] = field(default_factory=list)
     cancelled: bool = False
     busy: bool = False
 
@@ -309,11 +309,16 @@ async def run_claude_streaming(
     uid: str,
     state: UserState,
 ) -> None:
-    """Spawn claude --print and stream responses back to Telegram."""
+    """Spawn claude in interactive mode and stream responses back to Telegram.
+
+    Runs a single long-lived process per conversation. Mid-run injections
+    (messages sent while Claude is thinking) are written directly to stdin
+    at the next turn boundary — no subprocess restart or --resume needed.
+    """
     working_dir = get_working_dir(uid)
 
     cmd = [
-        "claude", "--print", "--output-format", "stream-json",
+        "claude", "--output-format", "stream-json",
         "--verbose", "--model", model,
         "--allowedTools", *ALLOWED_TOOLS,
     ]
@@ -322,13 +327,13 @@ async def run_claude_streaming(
         logger.info("Resuming session: %s...", session_id[:8])
     else:
         logger.info("Starting new session")
-    cmd.extend(["--", prompt])
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
     process = await asyncio.create_subprocess_exec(
         *cmd,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=working_dir,
@@ -337,6 +342,13 @@ async def run_claude_streaming(
         start_new_session=True,
     )
     state.process = process
+
+    # Send the initial prompt via stdin
+    try:
+        process.stdin.write((prompt + "\n").encode())
+        await process.stdin.drain()
+    except Exception as e:
+        logger.error("Failed to write initial prompt to stdin: %s", e)
 
     new_session_id = session_id
     buffer: list[str] = []
@@ -543,9 +555,37 @@ async def run_claude_streaming(
                             f"\U0001f6ab Permission denied: {denial_text[:500]}"
                         )
 
+                    await flush_buffer()
+
+                    # ── Inject next queued message into the running process ──
+                    if not state.cancelled and state.inject_queue:
+                        next_prompt = state.inject_queue.pop(0)
+                        logger.info("Injecting queued message for %s: %s...", uid, next_prompt[:50])
+                        await update.message.reply_text(
+                            f"\u21a9\ufe0f _{next_prompt[:80]}_", parse_mode="Markdown"
+                        )
+                        # Reset per-turn indicators
+                        thinking_indicator_sent = False
+                        first_text_received = False
+                        stream_start = time.monotonic()
+                        try:
+                            process.stdin.write((next_prompt + "\n").encode())
+                            await process.stdin.drain()
+                        except Exception as e:
+                            logger.error("Failed to inject message to stdin: %s", e)
+                            break
+                        continue  # keep streaming the next turn
+                    else:
+                        # No more messages — close stdin so process exits cleanly
+                        with contextlib.suppress(Exception):
+                            process.stdin.close()
+                        break
+
             except json.JSONDecodeError:
-                if line_text and not line_text.startswith("{"):
-                    buffer.append(line_text)
+                # Filter Claude's interactive mode UI artifacts (prompts, separators)
+                stripped = strip_ansi(line_text).strip()
+                if stripped and stripped not in (">", "> ", "?") and not stripped.startswith("> "):
+                    buffer.append(stripped)
 
             now = time.monotonic()
             if buffer and (now - last_send_time) > STREAM_INTERVAL:
@@ -601,33 +641,20 @@ async def run_and_drain(
     uid: str,
     state: UserState,
 ) -> None:
-    """Run Claude for initial_prompt, then drain queued messages iteratively."""
-    prompt: str | None = initial_prompt
+    """Run Claude for initial_prompt. Injected messages are handled internally
+    via stdin within run_claude_streaming — no outer loop needed."""
+    state.cancelled = False
+    model = get_user_model(uid)
+    session_id = get_current_session(uid)
 
-    while prompt is not None:
-        state.cancelled = False
-        model = get_user_model(uid)
-        session_id = get_current_session(uid)
+    status_text = f"({session_id[:8]}...)" if session_id else "(new)"
+    await update.message.reply_text(f"Claude {model} {status_text}...")
 
-        status_text = f"({session_id[:8]}...)" if session_id else "(new)"
-        await update.message.reply_text(f"Claude {model} {status_text}...")
-
-        try:
-            await run_claude_streaming(
-                update, prompt, session_id, model, uid, state
-            )
-        except Exception:
-            logger.exception("Claude process failed for user %s", uid)
-            await update.message.reply_text("Claude process failed. Try again.")
-
-        # Drain next from queue
-        if state.cancelled or not state.queue:
-            prompt = None
-        else:
-            prompt = state.queue.pop(0)
-            await update.message.reply_text(
-                f"Processing queued: {prompt[:50]}..."
-            )
+    try:
+        await run_claude_streaming(update, initial_prompt, session_id, model, uid, state)
+    except Exception:
+        logger.exception("Claude process failed for user %s", uid)
+        await update.message.reply_text("Claude process failed. Try again.")
 
     # Release the busy flag — MUST be last
     state.busy = False
@@ -681,8 +708,8 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     state.cancelled = True
-    cleared = len(state.queue)
-    state.queue.clear()
+    cleared = len(state.inject_queue)
+    state.inject_queue.clear()
 
     process = state.process
     if process and process.returncode is None:
@@ -769,7 +796,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     session_id = get_current_session(uid)
     state = user_state.get(uid)
     is_running = state.busy if state else False
-    queued = len(state.queue) if state else 0
+    queued = len(state.inject_queue) if state else 0
     wd = get_working_dir(uid)
     uptime = int(time.monotonic() - start_time)
     uptime_str = f"{uptime // 3600}h {(uptime % 3600) // 60}m"
@@ -875,11 +902,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # No `await` between the check and set. This is atomic within
     # asyncio's single-threaded event loop.
     if state.busy:
-        state.queue.append(prompt)
-        pos = len(state.queue)
-        await update.message.reply_text(
-            f"Queued (position {pos}). Use /stop to cancel current."
-        )
+        state.inject_queue.append(prompt)
+        pos = len(state.inject_queue)
+        if state.process and state.process.returncode is None:
+            await update.message.reply_text(
+                f"\u23f3 Injected (#{pos}) — Claude will see this after current step."
+            )
+        else:
+            await update.message.reply_text(f"\u23f3 Queued (#{pos}).")
         return
     state.busy = True
     # ── END CRITICAL SECTION ─────────────────────────────────────
@@ -931,11 +961,14 @@ async def _submit_photos(
 
     # ── CRITICAL SECTION (same pattern as handle_message) ────────
     if state.busy:
-        state.queue.append(prompt)
-        pos = len(state.queue)
-        await update.message.reply_text(
-            f"Image(s) queued (position {pos}). Use /stop to cancel current."
-        )
+        state.inject_queue.append(prompt)
+        pos = len(state.inject_queue)
+        if state.process and state.process.returncode is None:
+            await update.message.reply_text(
+                f"\u23f3 Image injected (#{pos}) — Claude will see this after current step."
+            )
+        else:
+            await update.message.reply_text(f"\u23f3 Image queued (#{pos}).")
         return
     state.busy = True
     # ── END CRITICAL SECTION ─────────────────────────────────────
@@ -1023,7 +1056,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         state = user_state.setdefault(uid, UserState())
         prompt = f"Regarding your question, my answer is: {answer}"
         if state.busy:
-            state.queue.append(prompt)
+            state.inject_queue.append(prompt)
         else:
             state.busy = True
             # Create a fake-ish update for reply context
