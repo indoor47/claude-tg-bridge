@@ -36,7 +36,7 @@ from telegram.ext import (
 
 # ── Configuration ────────────────────────────────────────────────────
 
-VERSION = "15.0.0"
+VERSION = "15.3.1"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USERS = {
     int(x)
@@ -49,12 +49,19 @@ MAX_MSG_LEN = 4000
 STREAM_INTERVAL = 3  # seconds between Telegram message flushes
 READLINE_TIMEOUT = 0.3  # seconds — how often to check cancellation
 PROCESS_TIMEOUT = 3600  # 1 hour max per Claude invocation
+THINKING_INDICATOR_DELAY = 8  # seconds before showing "thinking..." hint
+TYPING_ACTION_INTERVAL = 4  # seconds between sendChatAction("typing") pings
+STILL_WORKING_INTERVAL = 60  # seconds between "still working..." messages
 IMAGE_DIR = Path("/tmp/tg_images")
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_TOOLS = [
     "Bash", "Read", "Edit", "Write", "Glob", "Grep",
-    "WebFetch", "WebSearch", "Task(Explore)", "Task(Plan)",
+    "WebFetch", "WebSearch", "Task", "TaskOutput", "TaskStop",
+    "Task(Explore)", "Task(Plan)", "Task(Bash)",
+    "AskUserQuestion", "TodoWrite", "NotebookEdit",
+    "EnterPlanMode", "ExitPlanMode", "EnterWorktree",
+    "Skill", "ToolSearch",
 ]
 
 # ── Logging ──────────────────────────────────────────────────────────
@@ -323,7 +330,7 @@ async def run_claude_streaming(
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
         cwd=working_dir,
         env=env,
         limit=10 * 1024 * 1024,
@@ -343,6 +350,62 @@ async def run_claude_streaming(
                 await send_safe(update, text)
             buffer = []
             last_send_time = time.monotonic()
+
+    # Track stderr in background
+    stderr_lines: list[str] = []
+
+    async def read_stderr() -> None:
+        """Read stderr in background to capture Claude CLI errors."""
+        try:
+            while True:
+                line = await process.stderr.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    stderr_lines.append(text)
+                    logger.warning("Claude stderr: %s", text[:200])
+        except Exception:
+            pass
+
+    stderr_task = asyncio.create_task(read_stderr())
+    thinking_indicator_sent = False
+    first_text_received = False
+    stream_start = time.monotonic()
+
+    # Continuous typing indicator — shows "Bot is typing..." in chat header
+    typing_active = True
+
+    async def typing_heartbeat() -> None:
+        """Send typing action every few seconds while Claude is running."""
+        chat_id = update.message.chat_id
+        bot = update.message.get_bot()
+        while typing_active:
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action="typing")
+            except Exception:
+                pass
+            await asyncio.sleep(TYPING_ACTION_INTERVAL)
+
+    typing_task = asyncio.create_task(typing_heartbeat())
+
+    # "Still working..." periodic message for long operations
+    async def still_working_notifier() -> None:
+        """Send periodic status if Claude is silent for a long time."""
+        await asyncio.sleep(STILL_WORKING_INTERVAL)
+        while typing_active:
+            try:
+                elapsed = int(time.monotonic() - stream_start)
+                mins = elapsed // 60
+                await update.message.reply_text(
+                    f"_Still working... ({mins}m elapsed)_",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(STILL_WORKING_INTERVAL)
+
+    still_working_task = asyncio.create_task(still_working_notifier())
 
     try:
         while True:
@@ -365,6 +428,16 @@ async def run_claude_streaming(
                 now = time.monotonic()
                 if buffer and (now - last_send_time) > STREAM_INTERVAL:
                     await flush_buffer()
+                # Show thinking indicator if no text received yet
+                if (
+                    not thinking_indicator_sent
+                    and not first_text_received
+                    and (now - stream_start) > THINKING_INDICATOR_DELAY
+                ):
+                    thinking_indicator_sent = True
+                    await update.message.reply_text(
+                        "\U0001f9e0 Thinking..."
+                    )
                 continue
             except Exception as e:
                 logger.info("Read error (likely killed): %s", e)
@@ -388,12 +461,88 @@ async def run_claude_streaming(
                     for block in data.get("message", {}).get("content", []):
                         if block.get("type") == "text" and block.get("text"):
                             buffer.append(block["text"])
+                            first_text_received = True
                         elif block.get("type") == "tool_use":
                             tool_name = block.get("name", "tool")
+                            tool_input = block.get("input", {})
                             await flush_buffer()
-                            await update.message.reply_text(
-                                f"\U0001f527 Using: {tool_name}"
-                            )
+                            first_text_received = True
+
+                            if tool_name == "AskUserQuestion":
+                                # Show the question with inline keyboard options
+                                questions = tool_input.get("questions", [])
+                                for q in questions:
+                                    q_text = q.get("question", "")
+                                    options = q.get("options", [])
+                                    header = q.get("header", "")
+                                    if options:
+                                        keyboard = []
+                                        for opt in options:
+                                            label = opt.get("label", "?")
+                                            desc = opt.get("description", "")
+                                            btn_text = label
+                                            if desc:
+                                                btn_text = f"{label}"
+                                            keyboard.append(
+                                                [InlineKeyboardButton(
+                                                    btn_text,
+                                                    callback_data=f"answer:{label[:50]}"
+                                                )]
+                                            )
+                                        # Add descriptions below the question
+                                        desc_lines = []
+                                        for opt in options:
+                                            if opt.get("description"):
+                                                desc_lines.append(
+                                                    f"  {opt['label']}: {opt['description']}"
+                                                )
+                                        full_text = f"\u2753 {q_text}"
+                                        if desc_lines:
+                                            full_text += "\n" + "\n".join(desc_lines)
+                                        await update.message.reply_text(
+                                            full_text,
+                                            reply_markup=InlineKeyboardMarkup(keyboard),
+                                        )
+                                    else:
+                                        await update.message.reply_text(
+                                            f"\u2753 {q_text}"
+                                        )
+                            else:
+                                await update.message.reply_text(
+                                    f"\U0001f527 Using: {tool_name}"
+                                )
+                        elif block.get("type") == "thinking":
+                            # Extended thinking block — show indicator once
+                            if not thinking_indicator_sent:
+                                thinking_indicator_sent = True
+                                await update.message.reply_text(
+                                    "\U0001f9e0 Thinking..."
+                                )
+
+                elif msg_type == "result":
+                    is_error = data.get("is_error", False)
+                    errors = data.get("errors", [])
+                    denials = data.get("permission_denials", [])
+
+                    if is_error and errors:
+                        error_text = "\n".join(str(e)[:300] for e in errors[:3])
+                        logger.error("Claude error result: %s", error_text[:500])
+                        await update.message.reply_text(
+                            f"\u26a0\ufe0f Claude error:\n{error_text[:1500]}"
+                        )
+                    elif is_error:
+                        logger.error("Claude returned error (no details)")
+                        await update.message.reply_text(
+                            "\u26a0\ufe0f Claude process returned an error."
+                        )
+
+                    if denials:
+                        denial_text = ", ".join(str(d)[:100] for d in denials[:5])
+                        logger.warning("Permission denials: %s", denial_text)
+                        await update.message.reply_text(
+                            f"\U0001f6ab Permission denied: {denial_text[:500]}"
+                        )
+
             except json.JSONDecodeError:
                 if line_text and not line_text.startswith("{"):
                     buffer.append(line_text)
@@ -407,13 +556,34 @@ async def run_claude_streaming(
         await update.message.reply_text(f"Error: {str(e)[:200]}")
 
     finally:
+        # Stop typing indicator and still-working notifier immediately
+        typing_active = False
+        typing_task.cancel()
+        still_working_task.cancel()
+        # Don't await — let them clean up in background
+
         state.process = None
         try:
-            await asyncio.wait_for(process.wait(), timeout=5.0)
+            await asyncio.wait_for(process.wait(), timeout=2.0)
         except (asyncio.TimeoutError, Exception):
             with contextlib.suppress(Exception):
                 process.kill()
+
+        # Clean up stderr reader
+        stderr_task.cancel()
+
         await flush_buffer()
+
+        # Check exit code
+        rc = process.returncode
+        if rc and rc != 0 and not state.cancelled:
+            err_hint = ""
+            if stderr_lines:
+                err_hint = "\n" + "\n".join(stderr_lines[-3:])[:500]
+            logger.warning("Claude exited with code %d%s", rc, err_hint)
+            await update.message.reply_text(
+                f"\u26a0\ufe0f Claude exited (code {rc}){err_hint}"
+            )
 
         if new_session_id:
             try:
@@ -604,12 +774,25 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     uptime = int(time.monotonic() - start_time)
     uptime_str = f"{uptime // 3600}h {(uptime % 3600) // 60}m"
 
+    # Check session file size
+    session_size = ""
+    if session_id:
+        import glob as globmod
+        matches = globmod.glob(f"/root/.claude/projects/-root/{session_id}*.jsonl")
+        if matches:
+            import os as osmod
+            size_mb = osmod.path.getsize(matches[0]) / (1024 * 1024)
+            session_size = f"Session size: {size_mb:.1f} MB\n"
+            if size_mb > 20:
+                session_size += "\u26a0\ufe0f Large session — consider /new\n"
+
     await update.message.reply_text(
         f"*Status*\n"
         f"Model: *{model}*\n"
         f"Session: `{session_id[:16] if session_id else 'None'}...`\n"
         f"Running: {'Yes' if is_running else 'No'}\n"
         f"Queued: {queued}\n"
+        f"{session_size}"
         f"Working dir: `{wd}`\n"
         f"Uptime: {uptime_str}\n"
         f"Version: {VERSION}",
@@ -829,6 +1012,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(
             f"Resumed session:\n`{session_id}`", parse_mode="Markdown"
         )
+
+    elif query.data and query.data.startswith("answer:"):
+        answer = query.data[7:]
+        await query.answer(f"Selected: {answer}")
+        await query.edit_message_text(
+            f"\u2705 Selected: {answer}"
+        )
+        # Feed the answer as a follow-up message to Claude
+        state = user_state.setdefault(uid, UserState())
+        prompt = f"Regarding your question, my answer is: {answer}"
+        if state.busy:
+            state.queue.append(prompt)
+        else:
+            state.busy = True
+            # Create a fake-ish update for reply context
+            asyncio.create_task(
+                run_and_drain(query, prompt, uid, state)
+            )
 
 
 # ── Error Handler ────────────────────────────────────────────────────
