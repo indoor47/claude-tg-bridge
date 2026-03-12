@@ -36,7 +36,7 @@ from telegram.ext import (
 
 # ── Configuration ────────────────────────────────────────────────────
 
-VERSION = "16.0.0"
+VERSION = "16.1.0"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USERS = {
     int(x)
@@ -309,16 +309,11 @@ async def run_claude_streaming(
     uid: str,
     state: UserState,
 ) -> None:
-    """Spawn claude in interactive mode and stream responses back to Telegram.
-
-    Runs a single long-lived process per conversation. Mid-run injections
-    (messages sent while Claude is thinking) are written directly to stdin
-    at the next turn boundary — no subprocess restart or --resume needed.
-    """
+    """Spawn claude --print and stream responses back to Telegram."""
     working_dir = get_working_dir(uid)
 
     cmd = [
-        "claude", "--output-format", "stream-json",
+        "claude", "--print", "--output-format", "stream-json",
         "--verbose", "--model", model,
         "--allowedTools", *ALLOWED_TOOLS,
     ]
@@ -327,13 +322,13 @@ async def run_claude_streaming(
         logger.info("Resuming session: %s...", session_id[:8])
     else:
         logger.info("Starting new session")
+    cmd.extend(["--", prompt])
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
     process = await asyncio.create_subprocess_exec(
         *cmd,
-        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=working_dir,
@@ -342,13 +337,6 @@ async def run_claude_streaming(
         start_new_session=True,
     )
     state.process = process
-
-    # Send the initial prompt via stdin
-    try:
-        process.stdin.write((prompt + "\n").encode())
-        await process.stdin.drain()
-    except Exception as e:
-        logger.error("Failed to write initial prompt to stdin: %s", e)
 
     new_session_id = session_id
     buffer: list[str] = []
@@ -555,37 +543,11 @@ async def run_claude_streaming(
                             f"\U0001f6ab Permission denied: {denial_text[:500]}"
                         )
 
-                    await flush_buffer()
-
-                    # ── Inject next queued message into the running process ──
-                    if not state.cancelled and state.inject_queue:
-                        next_prompt = state.inject_queue.pop(0)
-                        logger.info("Injecting queued message for %s: %s...", uid, next_prompt[:50])
-                        await update.message.reply_text(
-                            f"\u21a9\ufe0f _{next_prompt[:80]}_", parse_mode="Markdown"
-                        )
-                        # Reset per-turn indicators
-                        thinking_indicator_sent = False
-                        first_text_received = False
-                        stream_start = time.monotonic()
-                        try:
-                            process.stdin.write((next_prompt + "\n").encode())
-                            await process.stdin.drain()
-                        except Exception as e:
-                            logger.error("Failed to inject message to stdin: %s", e)
-                            break
-                        continue  # keep streaming the next turn
-                    else:
-                        # No more messages — close stdin so process exits cleanly
-                        with contextlib.suppress(Exception):
-                            process.stdin.close()
-                        break
+                    break
 
             except json.JSONDecodeError:
-                # Filter Claude's interactive mode UI artifacts (prompts, separators)
-                stripped = strip_ansi(line_text).strip()
-                if stripped and stripped not in (">", "> ", "?") and not stripped.startswith("> "):
-                    buffer.append(stripped)
+                if line_text and not line_text.startswith("{"):
+                    buffer.append(line_text)
 
             now = time.monotonic()
             if buffer and (now - last_send_time) > STREAM_INTERVAL:
@@ -641,20 +603,36 @@ async def run_and_drain(
     uid: str,
     state: UserState,
 ) -> None:
-    """Run Claude for initial_prompt. Injected messages are handled internally
-    via stdin within run_claude_streaming — no outer loop needed."""
-    state.cancelled = False
-    model = get_user_model(uid)
-    session_id = get_current_session(uid)
+    """Run Claude, then immediately drain any injected messages via --resume.
 
-    status_text = f"({session_id[:8]}...)" if session_id else "(new)"
-    await update.message.reply_text(f"Claude {model} {status_text}...")
+    Injected messages (sent while Claude was running) are picked up right
+    after the current turn ends — no delay, no noisy queue messages.
+    """
+    prompt: str | None = initial_prompt
+    first = True
 
-    try:
-        await run_claude_streaming(update, initial_prompt, session_id, model, uid, state)
-    except Exception:
-        logger.exception("Claude process failed for user %s", uid)
-        await update.message.reply_text("Claude process failed. Try again.")
+    while prompt is not None:
+        state.cancelled = False
+        model = get_user_model(uid)
+        session_id = get_current_session(uid)
+
+        if first:
+            status_text = f"({session_id[:8]}...)" if session_id else "(new)"
+            await update.message.reply_text(f"Claude {model} {status_text}...")
+            first = False
+
+        try:
+            await run_claude_streaming(update, prompt, session_id, model, uid, state)
+        except Exception:
+            logger.exception("Claude process failed for user %s", uid)
+            await update.message.reply_text("Claude process failed. Try again.")
+
+        if state.cancelled or not state.inject_queue:
+            prompt = None
+        else:
+            prompt = state.inject_queue.pop(0)
+            logger.info("Draining injected message for %s: %s...", uid, prompt[:50])
+            # No "Processing queued" message — just continue seamlessly
 
     # Release the busy flag — MUST be last
     state.busy = False
